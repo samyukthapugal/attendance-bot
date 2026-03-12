@@ -5,21 +5,18 @@ from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, ConversationHandler
+    MessageHandler, filters, ContextTypes
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Config ──────────────────────────────────────────────────────────────────
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ADMIN_ID    = int(os.environ.get("ADMIN_ID", "0"))   # your Telegram user ID
-DATA_FILE   = "attendance.json"
+# ── Config ───────────────────────────────────────────────────────────────────
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+ADMIN_ID  = int(os.environ.get("ADMIN_ID", "0"))
+DATA_FILE = "attendance.json"
 
-# ConversationHandler state
-WAITING_REASON = 1
-
-# ── Data helpers ─────────────────────────────────────────────────────────────
+# ── Data helpers ──────────────────────────────────────────────────────────────
 def load_data() -> dict:
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE) as f:
@@ -34,30 +31,76 @@ def current_session(data: dict) -> dict | None:
     sid = data.get("current_session")
     return data["sessions"].get(sid) if sid else None
 
-# ── Admin helpers ─────────────────────────────────────────────────────────────
 def is_admin(update: Update) -> bool:
     return update.effective_user.id == ADMIN_ID
+
+# ── Build live attendance message ─────────────────────────────────────────────
+def build_attendance_message(data: dict, sid: str) -> tuple[str, InlineKeyboardMarkup]:
+    sess = data["sessions"][sid]
+    lines = [f"🏉 *Training — {sess['label']}*\n"]
+
+    coming, not_coming, no_response = [], [], []
+
+    for uid, pinfo in data["players"].items():
+        record = sess["attendance"].get(uid)
+        name   = pinfo["name"]
+        if not record:
+            no_response.append(f"⬜ {name}")
+        elif record["status"] == "yes":
+            coming.append(f"✅ {name}")
+        else:
+            reason = record.get("reason") or "—"
+            not_coming.append(f"❌ {name} _{reason}_")
+
+    all_rows = coming + not_coming + no_response
+    lines.append("\n".join(all_rows) if all_rows else "_No players registered yet_")
+
+    total = len(data["players"])
+    lines.append(f"\n✅ {len(coming)}  ❌ {len(not_coming)}  ⬜ {len(no_response)}/{total}")
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Coming",     callback_data=f"attend|yes|{sid}"),
+        InlineKeyboardButton("❌ Not Coming", callback_data=f"attend|no|{sid}"),
+    ]])
+
+    return "\n".join(lines), keyboard
+
+# ── Edit the live group message ───────────────────────────────────────────────
+async def refresh_attendance_message(ctx: ContextTypes.DEFAULT_TYPE, data: dict, sid: str):
+    sess       = data["sessions"][sid]
+    chat_id    = sess.get("chat_id")
+    message_id = sess.get("message_id")
+    if not chat_id or not message_id:
+        return
+    text, keyboard = build_attendance_message(data, sid)
+    try:
+        await ctx.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        logger.warning(f"Could not refresh attendance message: {e}")
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     data = load_data()
-
-    uid = str(user.id)
+    uid  = str(user.id)
     if uid not in data["players"]:
         data["players"][uid] = {"name": user.full_name, "username": user.username or ""}
         save_data(data)
-
     await update.message.reply_text(
         f"👋 Hey {user.first_name}! You're registered for Kabaddi attendance.\n\n"
-        "You'll get a button in the group when training is scheduled.\n"
-        "Use /attendance to check the current session anytime."
+        "When a session is posted in the group, tap your button there to mark attendance."
     )
 
 
 async def new_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin only — /newsession 14 March 7:00 PM"""
+    """/newsession 14 March 7:00 PM — Admin only"""
     if not is_admin(update):
         await update.message.reply_text("⛔ Only the admin can create sessions.")
         return
@@ -70,81 +113,39 @@ async def new_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     sid  = datetime.now().strftime("%Y%m%d%H%M%S")
     data["sessions"][sid] = {
-        "label": session_label,
+        "label":      session_label,
         "created_at": datetime.now().isoformat(),
-        "attendance": {}     # uid -> {status, reason}
+        "attendance": {},
+        "chat_id":    None,
+        "message_id": None,
     }
     data["current_session"] = sid
     save_data(data)
 
-    # Build inline keyboard
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Coming",     callback_data=f"attend|yes|{sid}"),
-            InlineKeyboardButton("❌ Not Coming", callback_data=f"attend|no|{sid}"),
-        ]
-    ])
+    text, keyboard = build_attendance_message(data, sid)
+    sent = await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
-    await update.message.reply_text(
-        f"🏉 *Training Session*\n📅 {session_label}\n\nAre you coming?",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
+    # Save message ref so we can edit it on every update
+    data["sessions"][sid]["chat_id"]    = sent.chat_id
+    data["sessions"][sid]["message_id"] = sent.message_id
+    save_data(data)
 
-
-async def attendance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Anyone can call /attendance"""
-    data = load_data()
-    sess = current_session(data)
-
-    if not sess:
-        await update.message.reply_text("No session scheduled yet.")
-        return
-
-    lines = [f"📋 *Attendance — {sess['label']}*\n"]
-    for uid, pinfo in data["players"].items():
-        record = sess["attendance"].get(uid)
-        name   = pinfo["name"]
-        if not record:
-            lines.append(f"⬜ {name} — No response")
-        elif record["status"] == "yes":
-            lines.append(f"✅ {name} — Coming")
-        else:
-            reason = record.get("reason", "—")
-            lines.append(f"❌ {name} — Not Coming ({reason})")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def edit_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Any player edits their own response — /edit"""
-    data = load_data()
-    sess = current_session(data)
-
-    if not sess:
-        await update.message.reply_text("No active session to edit.")
-        return
-
-    sid      = data["current_session"]
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Coming",     callback_data=f"attend|yes|{sid}"),
-            InlineKeyboardButton("❌ Not Coming", callback_data=f"attend|no|{sid}"),
-        ]
-    ])
-    await update.message.reply_text(
-        f"✏️ Update your attendance for *{sess['label']}*:",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
+    # Pin it so it stays visible at the top
+    try:
+        await ctx.bot.pin_chat_message(
+            chat_id=sent.chat_id,
+            message_id=sent.message_id,
+            disable_notification=True
+        )
+    except Exception:
+        pass  # bot may not have pin permission — not critical
 
 
 async def edit_player(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin edits another player — /editplayer @username"""
+    """/editplayer @username — Admin only"""
     if not is_admin(update):
         await update.message.reply_text("⛔ Only the admin can use this.")
         return
-
     if not ctx.args:
         await update.message.reply_text("Usage: /editplayer @username")
         return
@@ -152,46 +153,40 @@ async def edit_player(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     target_username = ctx.args[0].lstrip("@").lower()
     data = load_data()
     sess = current_session(data)
-
     if not sess:
         await update.message.reply_text("No active session.")
         return
 
-    # Find player by username
-    target_uid = None
-    for uid, pinfo in data["players"].items():
-        if pinfo.get("username", "").lower() == target_username:
-            target_uid = uid
-            break
-
+    target_uid = next(
+        (uid for uid, p in data["players"].items()
+         if p.get("username", "").lower() == target_username),
+        None
+    )
     if not target_uid:
-        await update.message.reply_text(f"Player @{target_username} not found. They must /start the bot first.")
+        await update.message.reply_text(f"@{target_username} not found. They must /start the bot first.")
         return
 
     sid      = data["current_session"]
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Coming",     callback_data=f"admin|yes|{sid}|{target_uid}"),
-            InlineKeyboardButton("❌ Not Coming", callback_data=f"admin|no|{sid}|{target_uid}"),
-        ]
-    ])
-    pname = data["players"][target_uid]["name"]
+    pname    = data["players"][target_uid]["name"]
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Coming",     callback_data=f"admin|yes|{sid}|{target_uid}"),
+        InlineKeyboardButton("❌ Not Coming", callback_data=f"admin|no|{sid}|{target_uid}"),
+    ]])
     await update.message.reply_text(
-        f"✏️ Editing attendance for *{pname}* — {sess['label']}:",
+        f"✏️ Editing *{pname}* for {sess['label']}:",
         parse_mode="Markdown",
         reply_markup=keyboard
     )
 
 
 async def add_player(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin manually adds a player by user ID — /addplayer <user_id> <Name>"""
+    """/addplayer <user_id> Full Name — Admin only"""
     if not is_admin(update):
         await update.message.reply_text("⛔ Only the admin can use this.")
         return
     if len(ctx.args) < 2:
         await update.message.reply_text("Usage: /addplayer <user_id> Full Name")
         return
-
     uid  = ctx.args[0]
     name = " ".join(ctx.args[1:])
     data = load_data()
@@ -201,6 +196,7 @@ async def add_player(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def list_players(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/listplayers — Admin only"""
     if not is_admin(update):
         await update.message.reply_text("⛔ Only the admin can use this.")
         return
@@ -215,7 +211,7 @@ async def list_players(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-# ── Callback: button presses ──────────────────────────────────────────────────
+# ── Button handler ────────────────────────────────────────────────────────────
 
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -223,31 +219,31 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     parts = query.data.split("|")
     kind  = parts[0]
+    data  = load_data()
 
-    data = load_data()
-
-    # ── Player pressing their own button ──
     if kind == "attend":
         _, status, sid = parts
         uid = str(query.from_user.id)
 
         if sid != data.get("current_session"):
-            await query.edit_message_text("⚠️ This session is no longer active.")
+            await query.answer("⚠️ This session is no longer active.", show_alert=True)
             return
-
         if uid not in data["players"]:
-            await query.answer("Please send /start to the bot first in a private chat.", show_alert=True)
+            await query.answer("Please send /start to the bot in a private chat first.", show_alert=True)
             return
 
         if status == "yes":
             data["sessions"][sid]["attendance"][uid] = {"status": "yes", "reason": ""}
             save_data(data)
-            name = data["players"][uid]["name"]
-            await query.answer(f"✅ Marked you as Coming, {name}!", show_alert=False)
+            await query.answer("✅ Marked as Coming!", show_alert=False)
+            await refresh_attendance_message(ctx, data, sid)
 
-        else:  # not coming — ask reason via DM
+        else:
+            # Record as not coming with empty reason, then ask for reason via DM
+            data["sessions"][sid]["attendance"][uid] = {"status": "no", "reason": ""}
+            save_data(data)
             ctx.user_data["pending_reason"] = {"sid": sid, "uid": uid}
-            await query.answer("Please check your DM to give a reason.", show_alert=True)
+            await query.answer("Check your DM to give a reason.", show_alert=True)
             try:
                 await ctx.bot.send_message(
                     chat_id=uid,
@@ -255,16 +251,16 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 await query.message.reply_text(
-                    f"@{query.from_user.username or query.from_user.first_name} — please send /start to me in a private chat first so I can ask for your reason."
+                    f"@{query.from_user.username or query.from_user.first_name} — "
+                    "please send /start to me privately first so I can collect your reason."
                 )
-        return
+            await refresh_attendance_message(ctx, data, sid)
 
-    # ── Admin editing another player ──
-    if kind == "admin":
+    elif kind == "admin":
         _, status, sid, target_uid = parts
 
         if sid != data.get("current_session"):
-            await query.edit_message_text("⚠️ This session is no longer active.")
+            await query.answer("⚠️ This session is no longer active.", show_alert=True)
             return
 
         if status == "yes":
@@ -272,21 +268,22 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             save_data(data)
             name = data["players"][target_uid]["name"]
             await query.edit_message_text(f"✅ {name} marked as Coming.")
+            await refresh_attendance_message(ctx, data, sid)
         else:
             ctx.user_data["pending_reason"] = {"sid": sid, "uid": target_uid, "admin": True}
             await query.edit_message_text("Type the reason for this player:")
 
 
-# ── Conversation: collect reason text ────────────────────────────────────────
+# ── Receive reason via DM ─────────────────────────────────────────────────────
 
 async def receive_reason(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pending = ctx.user_data.get("pending_reason")
     if not pending:
-        return  # not waiting for a reason from this user
+        return
 
-    reason  = update.message.text.strip()
-    sid     = pending["sid"]
-    uid     = pending["uid"]
+    reason = update.message.text.strip()
+    sid    = pending["sid"]
+    uid    = pending["uid"]
 
     data = load_data()
     if sid in data["sessions"]:
@@ -298,6 +295,9 @@ async def receive_reason(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = data["players"].get(uid, {}).get("name", uid)
     await update.message.reply_text(f"Got it! ❌ {name} — Not Coming: \"{reason}\"")
 
+    # Update the live group message with the reason filled in
+    await refresh_attendance_message(ctx, data, sid)
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -306,14 +306,10 @@ def main():
 
     app.add_handler(CommandHandler("start",       start))
     app.add_handler(CommandHandler("newsession",  new_session))
-    app.add_handler(CommandHandler("attendance",  attendance_cmd))
-    app.add_handler(CommandHandler("edit",        edit_cmd))
     app.add_handler(CommandHandler("editplayer",  edit_player))
     app.add_handler(CommandHandler("addplayer",   add_player))
     app.add_handler(CommandHandler("listplayers", list_players))
     app.add_handler(CallbackQueryHandler(button_handler))
-
-    # Catch plain text messages (for reason collection)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reason))
 
     logger.info("Bot started...")
