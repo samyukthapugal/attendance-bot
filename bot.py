@@ -12,16 +12,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Config ───────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ADMIN_ID  = int(os.environ.get("ADMIN_ID", "0"))
-DATA_FILE = "attendance.json"
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+ADMIN_ID    = int(os.environ.get("ADMIN_ID", "0"))
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")   # e.g. https://yourapp.up.railway.app
+PORT        = int(os.environ.get("PORT", "8080"))
+DATA_FILE   = "attendance.json"
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
 def load_data() -> dict:
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE) as f:
             return json.load(f)
-    return {"players": {}, "sessions": {}, "current_session": None}
+    return {"players": {}, "sessions": {}, "current_session": None, "pending_reasons": {}}
 
 def save_data(data: dict):
     with open(DATA_FILE, "w") as f:
@@ -65,7 +67,7 @@ def build_attendance_message(data: dict, sid: str) -> tuple[str, InlineKeyboardM
 
     return "\n".join(lines), keyboard
 
-# ── Edit the live group message ───────────────────────────────────────────────
+# ── Refresh the live group message ───────────────────────────────────────────
 async def refresh_attendance_message(ctx: ContextTypes.DEFAULT_TYPE, data: dict, sid: str):
     sess       = data["sessions"][sid]
     chat_id    = sess.get("chat_id")
@@ -125,12 +127,10 @@ async def new_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text, keyboard = build_attendance_message(data, sid)
     sent = await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
-    # Save message ref so we can edit it on every update
     data["sessions"][sid]["chat_id"]    = sent.chat_id
     data["sessions"][sid]["message_id"] = sent.message_id
     save_data(data)
 
-    # Pin it so it stays visible at the top
     try:
         await ctx.bot.pin_chat_message(
             chat_id=sent.chat_id,
@@ -138,7 +138,7 @@ async def new_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             disable_notification=True
         )
     except Exception:
-        pass  # bot may not have pin permission — not critical
+        pass
 
 
 async def edit_player(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -179,22 +179,6 @@ async def edit_player(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def add_player(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/addplayer <user_id> Full Name — Admin only"""
-    if not is_admin(update):
-        await update.message.reply_text("⛔ Only the admin can use this.")
-        return
-    if len(ctx.args) < 2:
-        await update.message.reply_text("Usage: /addplayer <user_id> Full Name")
-        return
-    uid  = ctx.args[0]
-    name = " ".join(ctx.args[1:])
-    data = load_data()
-    data["players"][uid] = {"name": name, "username": ""}
-    save_data(data)
-    await update.message.reply_text(f"✅ Added {name} (ID: {uid})")
-
-
 async def list_players(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/listplayers — Admin only"""
     if not is_admin(update):
@@ -233,16 +217,18 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         if status == "yes":
+            # Clear any pending reason if they switch to coming
+            data.setdefault("pending_reasons", {}).pop(uid, None)
             data["sessions"][sid]["attendance"][uid] = {"status": "yes", "reason": ""}
             save_data(data)
             await query.answer("✅ Marked as Coming!", show_alert=False)
             await refresh_attendance_message(ctx, data, sid)
 
         else:
-            # Record as not coming with empty reason, then ask for reason via DM
+            # Mark not coming, store pending reason in file (survives serverless restarts)
             data["sessions"][sid]["attendance"][uid] = {"status": "no", "reason": ""}
+            data.setdefault("pending_reasons", {})[uid] = {"sid": sid}
             save_data(data)
-            ctx.user_data["pending_reason"] = {"sid": sid, "uid": uid}
             await query.answer("Check your DM to give a reason.", show_alert=True)
             try:
                 await ctx.bot.send_message(
@@ -264,38 +250,40 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         if status == "yes":
+            data.setdefault("pending_reasons", {}).pop(target_uid, None)
             data["sessions"][sid]["attendance"][target_uid] = {"status": "yes", "reason": ""}
             save_data(data)
             name = data["players"][target_uid]["name"]
             await query.edit_message_text(f"✅ {name} marked as Coming.")
             await refresh_attendance_message(ctx, data, sid)
         else:
-            ctx.user_data["pending_reason"] = {"sid": sid, "uid": target_uid, "admin": True}
+            admin_uid = str(query.from_user.id)
+            data.setdefault("pending_reasons", {})[target_uid] = {"sid": sid, "admin_chat": admin_uid}
+            save_data(data)
             await query.edit_message_text("Type the reason for this player:")
 
 
 # ── Receive reason via DM ─────────────────────────────────────────────────────
 
 async def receive_reason(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pending = ctx.user_data.get("pending_reason")
+    uid  = str(update.effective_user.id)
+    data = load_data()
+    pending = data.get("pending_reasons", {}).get(uid)
+
     if not pending:
         return
 
     reason = update.message.text.strip()
     sid    = pending["sid"]
-    uid    = pending["uid"]
 
-    data = load_data()
     if sid in data["sessions"]:
         data["sessions"][sid]["attendance"][uid] = {"status": "no", "reason": reason}
-        save_data(data)
 
-    ctx.user_data.pop("pending_reason", None)
+    data.setdefault("pending_reasons", {}).pop(uid, None)
+    save_data(data)
 
     name = data["players"].get(uid, {}).get("name", uid)
     await update.message.reply_text(f"Got it! ❌ {name} — Not Coming: \"{reason}\"")
-
-    # Update the live group message with the reason filled in
     await refresh_attendance_message(ctx, data, sid)
 
 
@@ -307,13 +295,17 @@ def main():
     app.add_handler(CommandHandler("start",       start))
     app.add_handler(CommandHandler("newsession",  new_session))
     app.add_handler(CommandHandler("editplayer",  edit_player))
-    app.add_handler(CommandHandler("addplayer",   add_player))
     app.add_handler(CommandHandler("listplayers", list_players))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reason))
 
-    logger.info("Bot started...")
-    app.run_polling()
+    logger.info("Bot starting with webhook...")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+        url_path=BOT_TOKEN,
+    )
 
 if __name__ == "__main__":
     main()
